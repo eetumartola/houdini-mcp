@@ -3,10 +3,12 @@
 from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
+import os
 import asyncio
 import select
 import logging
 import queue
+import base64
 import time
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -60,7 +62,7 @@ class HoudiniConnection:
                 self.sock = None
                 self._last_command_executed = False
     
-    
+
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Houdini and return the response"""
         # Try to connect if we don't have a valid connection
@@ -81,9 +83,14 @@ class HoudiniConnection:
             self.sock.sendall(command_json.encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
-            # For render operations, use a much longer timeout
+            # Set appropriate timeout based on command type and parameters
             if command_type == "render_scene":
-                self.sock.settimeout(120.0)  # 2 minutes for render operations
+                if params and params.get("use_opengl", True):
+                    self.sock.settimeout(60.0)  # 1 minute for OpenGL renders
+                    logger.info("Using 60 second timeout for OpenGL render")
+                else:
+                    self.sock.settimeout(120.0)  # 2 minutes for Mantra renders
+                    logger.info("Using 120 second timeout for Mantra render")
             else:
                 self.sock.settimeout(30.0)   # Default timeout for other operations
             
@@ -165,16 +172,16 @@ class HoudiniConnection:
                             logger.info(f"Image data received: {image_size} bytes")
                             
                             if isinstance(result["image_data"], str):
-                                # If it's already a string, it's likely already encoded
-                                logger.info("Image data is already a string, length: " + 
-                                            f"{len(result['image_data'])}")
+                                # If it's already a string, assume it's base64 encoded
+                                logger.info(f"Image data is already a string (length: {len(result['image_data'])})")
+                                # We'll keep it as is - image processing functions will handle decoding
                             else:
-                                # Convert binary image data to base64 string
+                                # If it's binary, encode it to base64
                                 import base64
                                 try:
                                     encoded_data = base64.b64encode(result["image_data"]).decode('utf-8')
                                     result["image_data"] = encoded_data
-                                    logger.info(f"Converted image data to base64, length: {len(encoded_data)}")
+                                    logger.info(f"Converted binary image data to base64 (length: {len(encoded_data)})")
                                 except Exception as e:
                                     logger.error(f"Error encoding image data: {str(e)}")
                                     # Keep the image data as is if encoding fails
@@ -205,9 +212,19 @@ class HoudiniConnection:
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle"""
     try:
         logger.info("HoudiniMCP server starting up")
+        
+        # Start HTTP file server to serve rendered/test images from E:/MCP
+        rendered_dir = "E:/MCP"
+        if not os.path.exists(rendered_dir):
+            os.makedirs(rendered_dir)
+        try:
+            from file_server import start_file_server
+            httpd, http_thread = start_file_server(rendered_dir, port=8000)
+            logger.info(f"HTTP file server started on port 8000 serving {rendered_dir}")
+        except Exception as e:
+            logger.error(f"Failed to start HTTP file server: {str(e)}")
         
         try:
             houdini = get_houdini_connection()
@@ -218,12 +235,18 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         
         yield {}
     finally:
+        try:
+            httpd.shutdown()
+            logger.info("HTTP file server shutdown")
+        except Exception as e:
+            logger.error(f"Error shutting down HTTP file server: {str(e)}")
         global _houdini_connection
         if _houdini_connection:
             logger.info("Disconnecting from Houdini on shutdown")
             _houdini_connection.disconnect()
             _houdini_connection = None
         logger.info("HoudiniMCP server shut down")
+
 
 # Create the MCP server with lifespan support
 mcp = FastMCP(
@@ -513,6 +536,7 @@ def execute_houdini_code(ctx: Context, code: str) -> str:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
 
+
 @mcp.tool()
 def render_scene(
     ctx: Context,
@@ -520,23 +544,15 @@ def render_scene(
     resolution_x: int = None,
     resolution_y: int = None,
     camera_path: str = None,
-    image_name: str = None,
-    return_image: bool = True
+    image_name: str = None
 ) -> Any:
     """
-    Render the current Houdini scene and optionally return the image.
-    
-    Parameters:
-    - output_path: Optional path to save the rendered image
-    - resolution_x: Optional horizontal resolution
-    - resolution_y: Optional vertical resolution
-    - camera_path: Optional path to the camera to use for rendering
-    - image_name: Optional descriptive name for the rendered image
-    - return_image: If True, returns the rendered image as part of the response
+    Render the current Houdini scene and return the result as an MCP Image object.
     """
     try:
         houdini = get_houdini_connection()
-        
+
+        # Prepare parameters
         params = {}
         if output_path:
             params["output_path"] = output_path
@@ -548,119 +564,361 @@ def render_scene(
             params["camera_path"] = camera_path
         if image_name:
             params["image_name"] = image_name
-            
+
         logger.info(f"Sending render_scene command with parameters: {params}")
         result = houdini.send_command("render_scene", params)
-        logger.info(f"Received render result with keys: {list(result.keys())}")
-        
-        # Check if image data is available and return_image is requested
-        if return_image and "image_data" in result and result["image_data"]:
-            # Create an Image object from the binary data
+        logger.info(f"Received render result keys: {list(result.keys())}")
+
+        # Check if the render was successful
+        if "error" in result:
+            return {
+                "error": result["error"],
+                "message": "Rendering failed"
+            }
+
+        # Process the image data - it comes as a base64 encoded string in image_data
+        if "image_data" in result and result["image_data"]:
             try:
-                import base64
-                import io
-                from PIL import Image as PILImage
-                import inspect
-                import tempfile
-                import os
+                import tempfile, os, base64
+                from mcp.server.fastmcp import Image as MCPImage
                 
-                # Add debugging information about the Image class
-                logger.info(f"MCP Image class expects type: {inspect.signature(Image.__init__)}")
+                # Decode the base64 string to binary data
+                img_data = base64.b64decode(result["image_data"])
                 
-                # Log the image data length for debugging
-                logger.info(f"Processing image data, length: {len(result['image_data'])}")
+                # Save to a temporary file
+                timestamp = int(time.time())
+                temp_dir = tempfile.gettempdir()
+                img_path = os.path.join(temp_dir, f"houdini_render_{timestamp}.jpg")
                 
-                # Convert binary data to image
-                img_data = result["image_data"]
-                if isinstance(img_data, str):
-                    # If it's a string, assume it's base64 encoded
-                    img_data = base64.b64decode(img_data)
+                with open(img_path, "wb") as f:
+                    f.write(img_data)
                 
-                logger.info(f"Decoded image data, binary length: {len(img_data)}")
+                logger.info(f"Saved rendered image to {img_path} ({len(img_data)} bytes)")
                 
-                # Create a BytesIO object from the binary data
-                img_buffer = io.BytesIO(img_data)
-                img_buffer.seek(0)
+                # Create and return an MCP Image object
+                image = MCPImage(path=img_path)
+                logger.info("Successfully created MCPImage object")
                 
-                # Open the image using PIL
-                img = PILImage.open(img_buffer)
-                logger.info(f"Successfully created PIL Image: format={img.format}, size={img.size}, mode={img.mode}")
-                logger.info(f"Current data type: {type(img)}")
+                return image
                 
-                # Convert RGBA to RGB if needed
-                if img.mode == 'RGBA':
-                    img = img.convert('RGB')
-                    logger.info("Converted image from RGBA to RGB")
-                
-                # Since MCP Image expects a file path, save to a temporary file first
-                temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-                temp_path = temp_file.name
-                temp_file.close()  # Close the file so we can reopen it
-                
-                logger.info(f"Saving image to temporary file: {temp_path}")
-                img.save(temp_path, format="JPEG", quality=95)
-                
-                # Now create the MCP Image using the file path
-                logger.info(f"Creating MCP Image from path: {temp_path}")
-                mcp_image = Image(temp_path)
-                
-                logger.info("Successfully created MCP Image object")
-                
-                # Return both the image and render info
-                result_obj = {
-                    "message": f"Scene rendered successfully. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}",
-                    "image": mcp_image
-                }
-                
-                # Schedule the temporary file for deletion
-                # We can't delete it immediately as it's still being used
-                def cleanup_temp_file():
-                    try:
-                        if os.path.exists(temp_path):
-                            os.unlink(temp_path)
-                            logger.info(f"Deleted temporary file: {temp_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete temporary file {temp_path}: {str(e)}")
-                
-                # Start a thread to clean up after a delay
-                import threading
-                cleanup_thread = threading.Timer(60.0, cleanup_temp_file)  # Clean up after 60 seconds
-                cleanup_thread.daemon = True
-                cleanup_thread.start()
-                
-                return result_obj
-            
-            except Exception as e:
-                logger.error(f"Error processing image data: {str(e)}")
-                # Include the traceback for better debugging
+            except Exception as img_err:
+                logger.error(f"Error handling image data: {str(img_err)}")
                 import traceback
                 logger.error(traceback.format_exc())
-                
-                # Fall back to text response if image processing fails
-                return f"Scene rendered successfully (but image processing failed: {str(e)}). Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
-        else:
-            # Provide information about why the image wasn't returned
-            if not return_image:
-                logger.info("Image return was disabled by parameter")
-                return f"Scene rendered successfully (image return disabled). Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
-            elif "image_data" not in result:
-                logger.warning("No image_data found in the render result")
-                return f"Scene rendered successfully, but no image data was returned from Houdini. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
-            elif not result["image_data"]:
-                logger.warning("image_data is empty in the render result")
-                return f"Scene rendered successfully, but the image data is empty. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
-            else:
-                # This case shouldn't be reached but is here for completeness
-                logger.warning("Unknown reason for not processing image")
-                return f"Scene rendered successfully. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
-    except ConnectionError as e:
-        logger.error(f"Connection error: {str(e)}")
-        return f"Error rendering scene: Connection to Houdini failed: {str(e)}"
+                return {
+                    "error": f"Failed to process image data: {str(img_err)}"
+                }
+        
+        # If we got here, we couldn't find valid image data
+        return {
+            "message": "Scene rendered but no image data was returned",
+            "render_info": {
+                "output_path": result.get('output_path', 'unknown'),
+                "resolution": result.get('resolution', ['unknown', 'unknown']),
+                "camera": result.get('camera', 'default'),
+                "available_keys": list(result.keys())
+            }
+        }
+
     except Exception as e:
         logger.error(f"Error rendering scene: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        return f"Error rendering scene: {str(e)}"
+        return {
+            "error": f"Error rendering scene: {str(e)}"
+        }
+
+@mcp.tool()
+def diagnose_image_handling(ctx: Context) -> Any:
+    try:
+        import tempfile, os, time, base64
+        from PIL import Image as PILImage, ImageDraw, ImageFont
+
+        # Create a simple test image with text and shapes
+        width, height = 800, 600
+        img = PILImage.new("RGB", (width, height), color=(240, 240, 240))
+        draw = ImageDraw.Draw(img)
+        
+        draw.rectangle([(50, 50), (200, 200)], fill=(255, 0, 0), outline=(0, 0, 0))
+        draw.ellipse([(300, 100), (500, 300)], fill=(0, 255, 0), outline=(0, 0, 0))
+        draw.polygon([(600, 50), (700, 200), (500, 200)], fill=(0, 0, 255), outline=(0, 0, 0))
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", 36)
+        except IOError:
+            font = ImageFont.load_default()
+        draw.text((200, 400), "Houdini MCP Test Image", fill=(0, 0, 0), font=font)
+        draw.text((150, 450), "Red square, Green circle, Blue triangle", fill=(0, 0, 0), font=font)
+        draw.text((250, 500), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0), font=font)
+        
+        # Save the image to a temporary file
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, "houdini_mcp_test_image.jpg")
+        img.save(temp_path, format="JPEG", quality=95)
+        
+        # Open the file and encode the image data in base64
+        with open(temp_path, "rb") as f:
+            image_data = f.read()
+        encoded_image = base64.b64encode(image_data).decode("utf-8")
+        
+        return {
+            "message": "This is a test image created to diagnose image handling. "
+                       "If Claude can see this image, it should be able to describe these elements.",
+            "image": {
+                "data": encoded_image,
+                "format": "jpg",
+                "filename": os.path.basename(temp_path)
+            }
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in diagnose_image_handling: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@mcp.tool()
+def simple_image_diagnostics(ctx: Context) -> Any:
+    try:
+        import tempfile, os, base64
+        from PIL import Image as PILImage, ImageDraw, ImageFont
+
+        # Create a simple test image
+        width, height = 400, 300
+        img = PILImage.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        
+        # Draw a red rectangle
+        draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0))
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", 20)
+        except IOError:
+            font = ImageFont.load_default()
+        draw.text((180, 100), "Test Image", fill=(0, 0, 0), font=font)
+        
+        # Save the image to a temporary file
+        temp_file = os.path.join(tempfile.gettempdir(), "simple_test.jpg")
+        img.save(temp_file, "JPEG")
+        
+        # Read and encode the file to base64
+        with open(temp_file, "rb") as f:
+            img_data = f.read()
+        encoded_image = base64.b64encode(img_data).decode("utf-8")
+        
+        return {
+            "message": "Created a simple test image",
+            "image": {
+                "data": encoded_image,
+                "format": "jpg",
+                "filename": os.path.basename(temp_file)
+            },
+            "file_path": temp_file,
+            "file_size": len(img_data),
+            "dimensions": f"{width}x{height}"
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in simple_image_diagnostics: {str(e)}")
+        logger.error(traceback.format_exc())
+        return f"Error creating simple test image: {str(e)}"
+
+
+def test_render(self):
+    """Return a test image to verify image communication is working"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import tempfile, os, time, base64
+        
+        # Create a simple test image
+        width, height = 400, 300
+        img = Image.new("RGB", (width, height), color=(240, 240, 240))
+        draw = ImageDraw.Draw(img)
+        
+        draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0), outline=(0, 0, 0))
+        draw.text((180, 100), "Test Render Image", fill=(0, 0, 0))
+        draw.text((180, 150), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0))
+        
+        # Save to temporary file
+        temp_file = os.path.join(tempfile.gettempdir(), f"test_render_{int(time.time())}.jpg")
+        img.save(temp_file, "JPEG")
+        
+        # Read and encode to base64
+        with open(temp_file, "rb") as f:
+            image_data = f.read()
+        encoded_image_data = base64.b64encode(image_data).decode('utf-8')
+        
+        return {
+            "rendered": True,
+            "output_path": temp_file,
+            "resolution": ["400", "300"],
+            "camera": "test",
+            "image_data": encoded_image_data,
+            "image_size": len(image_data),
+            "render_time": "0s"
+        }
+    except Exception as e:
+        return {"error": f"Failed to create test render: {str(e)}"}
+@mcp.tool()
+def claude_vision_test(ctx: Context) -> Any:
+    try:
+        import os, time, base64, tempfile
+        from PIL import Image as PILImage, ImageDraw, ImageFont
+        from mcp.server.fastmcp import Image as MCPImage
+        
+        # Create and save image as before...
+        width, height = 256, 256
+        img = PILImage.new("RGB", (width, height), color=(240, 240, 240))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([(30, 30), (100, 100)], fill=(0, 0, 255), outline=(0, 0, 0))
+        draw.ellipse([(120, 30), (190, 100)], fill=(0, 255, 0), outline=(0, 0, 0))
+        verification_code = '715517'
+        draw.text((60, 10), "Claude Vision Test", fill=(0, 0, 0))
+        draw.text((60, 210), verification_code, fill=(255, 0, 0))
+        
+        temp_dir = tempfile.gettempdir()
+        file_path = os.path.join(temp_dir, f"test_{int(time.time())}.jpg")
+        img.save(file_path, format="JPEG", quality=95)
+        
+        # Create an MCP Image object with the file path
+        image = MCPImage(path=file_path)
+        
+        # Return the image object directly
+        return image
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in claude_vision_test: {str(e)}")
+        logger.error(traceback.format_exc())
+        return f"Error creating vision test: {str(e)}"
+
+
+
+
+@mcp.tool()
+def diagnose_image_import(ctx: Context) -> str:
+    """
+    Diagnoses the correct way to import and use the Image class from MCP.
+    """
+    import inspect
+    import importlib
+    import sys
+    import traceback
+    
+    # Output details about the current MCP module structure
+    result = {
+        "mcp_module_info": {}
+    }
+    
+    try:
+        # Check what's in the mcp module
+        import mcp
+        result["mcp_module_info"]["mcp_dir"] = dir(mcp)
+        
+        # Check server module
+        if hasattr(mcp, "server"):
+            result["mcp_module_info"]["server_dir"] = dir(mcp.server)
+            
+            # Check fastmcp module
+            if hasattr(mcp.server, "fastmcp"):
+                result["mcp_module_info"]["fastmcp_dir"] = dir(mcp.server.fastmcp)
+                
+                # Look specifically for image-related classes or functions
+                image_related = []
+                for name in dir(mcp.server.fastmcp):
+                    if "image" in name.lower():
+                        image_related.append(name)
+                result["mcp_module_info"]["image_related"] = image_related
+    except Exception as e:
+        result["mcp_module_info"]["error"] = str(e)
+    
+    # Try various ways to import and create an image
+    result["import_attempts"] = []
+    
+    # Simple test image data
+    import tempfile
+    import os
+    from PIL import Image as PILImage
+    
+    test_img = PILImage.new("RGB", (100, 100), color=(255, 0, 0))
+    test_path = os.path.join(tempfile.gettempdir(), "mcp_test_img.jpg")
+    test_img.save(test_path)
+    
+    # Attempt 1: Direct from mcp.server.fastmcp
+    try:
+        from mcp.server.fastmcp import Image as Image1
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp import Image",
+            "success": True,
+            "type": str(type(Image1)),
+            "signature": str(inspect.signature(Image1)) if callable(Image1) else "not callable"
+        })
+        
+        # Try to create an image
+        try:
+            img1 = Image1(path=test_path)
+            result["import_attempts"][0]["instance_created"] = True
+        except Exception as e:
+            result["import_attempts"][0]["instance_error"] = str(e)
+            result["import_attempts"][0]["instance_created"] = False
+    except Exception as e:
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp import Image",
+            "success": False,
+            "error": str(e)
+        })
+    
+    # Attempt 2: From utilities.types
+    try:
+        from mcp.server.fastmcp.utilities.types import Image as Image2
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp.utilities.types import Image",
+            "success": True,
+            "type": str(type(Image2)),
+            "signature": str(inspect.signature(Image2)) if callable(Image2) else "not callable"
+        })
+        
+        # Try to create an image
+        try:
+            img2 = Image2(path=test_path)
+            result["import_attempts"][1]["instance_created"] = True
+        except Exception as e:
+            result["import_attempts"][1]["instance_error"] = str(e)
+            result["import_attempts"][1]["instance_created"] = False
+    except Exception as e:
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp.utilities.types import Image",
+            "success": False,
+            "error": str(e)
+        })
+    
+    # Attempt 3: Look for a create_image function
+    try:
+        from mcp.server.fastmcp import create_image
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp import create_image",
+            "success": True,
+            "type": str(type(create_image)),
+            "signature": str(inspect.signature(create_image)) if callable(create_image) else "not callable"
+        })
+        
+        # Try to create an image
+        try:
+            img3 = create_image(path=test_path)
+            result["import_attempts"][2]["instance_created"] = True
+        except Exception as e:
+            result["import_attempts"][2]["instance_error"] = str(e)
+            result["import_attempts"][2]["instance_created"] = False
+    except Exception as e:
+        result["import_attempts"].append({
+            "method": "from mcp.server.fastmcp import create_image",
+            "success": False,
+            "error": str(e)
+        })
+        
+    return result
 
 @mcp.prompt()
 def asset_creation_strategy() -> str:
@@ -692,7 +950,13 @@ def asset_creation_strategy() -> str:
        - Set up proper hierarchy if needed
        - Apply materials
        - Configure lighting and camera
-       - Use render_scene() to generate the final output
+       
+    7. For rendering:
+       - Use render_scene() with use_opengl=True (default) for fast visualization
+       - Only use use_opengl=False when photorealistic rendering is required
+       - OpenGL rendering is significantly faster and more stable for quick views
+       - Set resolution_x and resolution_y for specific output dimensions
+       - Specify a camera_path if you want to render from a specific camera
     """
 
 # Main execution

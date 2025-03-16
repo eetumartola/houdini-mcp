@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import requests
 import select
+import base64
 import queue
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -23,7 +24,15 @@ class BinaryDataEncoder(json.JSONEncoder):
     def default(self, obj):
         import base64
         if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
+            try:
+                # Encode binary data to base64 with clear logging
+                encoded = base64.b64encode(obj).decode('utf-8')
+                print(f"Encoded {len(obj)} bytes of binary data to {len(encoded)} characters of base64")
+                return encoded
+            except Exception as e:
+                print(f"Error encoding binary data: {str(e)}")
+                # Return an empty string rather than failing completely
+                return ""
         return super().default(obj)
 
 class HoudiniMCPServer:
@@ -888,249 +897,117 @@ class HoudiniMCPServer:
             traceback.print_exc()
             raise Exception(f"Failed to copy object: {str(e)}")
 
-    def render_scene(self, output_path=None, resolution_x=None, resolution_y=None, camera_path=None, image_name=None):
-        """Render the current scene"""
+    def render_scene(
+        self,
+        output_path=None,
+        resolution_x=None,
+        resolution_y=None,
+        camera_path=None,
+        image_name=None
+    ):
+        """Render the current scene using OpenGL and properly package image data."""
         try:
-            print("Starting render process...")
-            
-            # Look for Mantra or other render nodes in /out
-            render_node = None
-            out_context = hou.node("/out")
-            
-            if out_context:
-                for child in out_context.children():
-                    if child.type().name() in ["ifd", "opengl"]:
-                        render_node = child
-                        print(f"Found existing render node: {render_node.path()}")
-                        break
-                        
-                if not render_node:
-                    render_node = out_context.createNode("ifd", "render_mcp")
-                    print(f"Created new render node: {render_node.path()}")
-            else:
-                raise ValueError("Could not find /out context")
-            
-            # Step 2: Prepare the output path
-            final_output_path = output_path
-            if not final_output_path:
-                # Create a descriptive filename
+            # Existing Houdini rendering logic, simplified here:
+            render_node = hou.node("/out/render_mcp_opengl")
+            if not render_node:
+                render_node = hou.node("/out").createNode("opengl", "render_mcp_opengl")
+
+            # Set output path
+            if not output_path:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                scene_name = hou.hipFile.basename().split('.')[0]
-                
-                filename = f"{scene_name}_{'custom' if image_name else 'render'}_{timestamp}.jpg"
-                if image_name:
-                    filename = f"{scene_name}_{image_name}_{timestamp}.jpg"
-                
-                # Use the Houdini project directory
                 hip_dir = os.path.dirname(hou.hipFile.path())
                 render_dir = os.path.join(hip_dir, "renders")
-                
-                # Create the render directory if it doesn't exist
                 if not os.path.exists(render_dir):
                     os.makedirs(render_dir)
-                    
-                final_output_path = os.path.join(render_dir, filename)
-                final_output_path = os.path.normpath(final_output_path)
-                print(f"Generated output path: {final_output_path}")
+                output_path = os.path.join(render_dir, f"render_{timestamp}.jpg")
             else:
-                # Ensure the extension is jpg if not specified
-                if not final_output_path.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    final_output_path = f"{final_output_path}.jpg"
-                final_output_path = os.path.normpath(final_output_path)
-                print(f"Using provided output path: {final_output_path}")
+                output_path = output_path
             
-            # Step 3: Configure resolution
-            if resolution_x is not None and resolution_y is not None:
-                print(f"Setting resolution to {resolution_x}x{resolution_y}")
-                res_override = render_node.parm("res_override")
-                if res_override:
-                    res_override.set(1)
-                    
-                    x_res = render_node.parm("res_overridex")
-                    if x_res:
-                        x_res.set(int(resolution_x))
-                    
-                    y_res = render_node.parm("res_overridey")
-                    if y_res:
-                        y_res.set(int(resolution_y))
-            
-            # Step 4: Configure camera
-            selected_camera = None
-            if camera_path:
-                camera_parm = render_node.parm("camera")
-                if camera_parm:
-                    camera_parm.set(camera_path)
-                    selected_camera = camera_path
-                    print(f"Using specified camera: {camera_path}")
-            else:
-                # Find a camera
-                obj_context = hou.node("/obj")
-                if obj_context:
-                    for node in obj_context.children():
-                        if node.type().name() in ["cam", "camera"]:
-                            camera_parm = render_node.parm("camera")
-                            if camera_parm:
-                                camera_parm.set(node.path())
-                                selected_camera = node.path()
-                                print(f"Found and using camera: {node.path()}")
-                                break
-            
-            # Step 5: Set output path and format
-            picture_parm = render_node.parm("vm_picture")
-            if picture_parm:
-                picture_parm.set(final_output_path)
-                print(f"Set output path parameter to: {final_output_path}")
-                
-            # Configure JPEG output if it's a Mantra node
-            if render_node.type().name() == "ifd":
-                jpeg_enable = render_node.parm("vm_image_jpeg_enable")
-                if jpeg_enable:
-                    jpeg_enable.set(1)
-                    print("Enabled JPEG output")
-                    
-                jpeg_quality = render_node.parm("vm_image_jpeg_quality")
-                if jpeg_quality:
-                    jpeg_quality.set(95)
-                    print("Set JPEG quality to 95")
-            
-            # Set output mode
-            output_mode = render_node.parm("soho_outputmode")
-            if output_mode:
-                output_mode.set(0)
-                print("Set output mode to 'Output to Disk'")
-            
-            # Step 6: Render with timing
-            print(f"Starting render with node: {render_node.path()}")
-            render_start_time = time.time()
-            
-            # Try to use blocking render if available
-            try:
-                render_node.render(block=True)
-            except TypeError:
-                # Fall back to standard render if blocking parameter isn't supported
-                render_node.render()
-                
-            render_duration = time.time() - render_start_time
-            print(f"Render function returned after {render_duration:.2f} seconds")
-            
-            # Check if Houdini reports rendering is still in progress
-            try:
-                is_rendering = render_node.isRendering()
-                if is_rendering:
-                    print("Warning: Houdini reports rendering is still in progress even though render() call returned")
-                    
-                    # Wait for rendering to complete if Houdini provides an API for it
-                    wait_count = 0
-                    while is_rendering and wait_count < 120:  # Wait up to 2 minutes more
-                        time.sleep(2)
-                        wait_count += 2
-                        is_rendering = render_node.isRendering()
-                        if wait_count % 10 == 0:
-                            print(f"Still waiting for rendering to complete... ({wait_count} seconds)")
-                    
-                    if is_rendering:
-                        print("Warning: Rendering still in progress after extended wait")
-                    else:
-                        print(f"Rendering completed after additional {wait_count} seconds")
-            except AttributeError:
-                print("Render node doesn't support isRendering() method, continuing with file check")
-            
-            # Step 7: Collect results
-            actual_res_x = "default"
-            actual_res_y = "default"
-            x_res_parm = render_node.parm("res_overridex")
-            y_res_parm = render_node.parm("res_overridey")
-            
-            if x_res_parm and y_res_parm:
-                actual_res_x = x_res_parm.eval()
-                actual_res_y = y_res_parm.eval()
-            
-            # Step 8: Wait for and read the image data with extended timeout
-            image_data = None
-            image_size = 0
-            
-            # Set a longer wait time based on the render duration
-            max_wait_time = max(60, render_duration * 2)  # At least 60 seconds or 2x render time
-            wait_interval = 1.0  # Check once per second
-            
-            print(f"Waiting up to {max_wait_time:.0f} seconds for rendered image to be available at {final_output_path}...")
+            picture_parm = render_node.parm("picture")
+            picture_parm.set(output_path)
+            camera_parm = render_node.parm("camera")
+            camera_parm.set(camera_path)
+            #render_node.parm("picture_format").set(0)  # Set JPEG format
+
+            # Execute render
+            render_start = time.time()
+            render_node.render()
+            render_duration = time.time() - render_start
+
+            # Wait for render completion
+            timeout = 10
             start_wait = time.time()
-            
-            # Track file changes to better understand filesystem behavior
-            last_modified_time = 0
-            last_size = 0
-            stable_count = 0
-            
-            while time.time() - start_wait < max_wait_time:
-                if os.path.exists(final_output_path):
-                    try:
-                        current_size = os.path.getsize(final_output_path)
-                        current_modified = os.path.getmtime(final_output_path)
-                        
-                        # Report changes
-                        if current_size != last_size:
-                            print(f"File size changed: {last_size} -> {current_size} bytes")
-                            last_size = current_size
-                            stable_count = 0
-                        elif current_size > 0:
-                            stable_count += 1
-                            
-                        if current_modified != last_modified_time:
-                            print(f"File modified time changed: {time.ctime(current_modified)}")
-                            last_modified_time = current_modified
-                            stable_count = 0
-                        
-                        # If file size is stable and non-zero for several checks, consider it complete
-                        if current_size > 0 and stable_count >= 3:
-                            print(f"File size stable at {current_size} bytes for {stable_count} checks, assuming render complete")
-                            break
-                    
-                    except (OSError, IOError) as e:
-                        print(f"Error checking file: {str(e)}, will retry...")
-                        # Continue with the wait loop
-                
-                time.sleep(wait_interval)
-            
-            # Final attempt to read the file after waiting
-            if os.path.exists(final_output_path):
-                try:
-                    file_size = os.path.getsize(final_output_path)
-                    print(f"Rendered image exists: {final_output_path}, size: {file_size} bytes")
-                    
-                    if file_size > 0:
-                        # Add a small additional delay to ensure file is fully written
-                        time.sleep(1.0)
-                        
-                        with open(final_output_path, 'rb') as f:
-                            image_data = f.read()
-                        image_size = len(image_data)
-                        print(f"Successfully read {image_size} bytes of image data")
-                    else:
-                        print("Warning: Rendered image file exists but is empty")
-                except Exception as e:
-                    print(f"Error reading image file: {str(e)}")
-                    traceback.print_exc()
-            else:
-                print(f"Warning: Rendered image file not found at {final_output_path} after waiting {max_wait_time:.0f} seconds")
-            
-            # Step 9: Return results
-            result = {
+            while not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                if time.time() - start_wait > timeout:
+                    raise Exception("Render timeout.")
+                time.sleep(0.5)
+
+            # Read image and encode to base64
+            with open(output_path, "rb") as f:
+                image_data = f.read()
+
+            encoded_image_data = base64.b64encode(image_data).decode('utf-8')
+
+            # Construct response with MCP-compatible Image object explicitly
+            response = {
                 "rendered": True,
-                "output_path": final_output_path,
-                "resolution": [actual_res_x, actual_res_y],
-                "camera": selected_camera,
-                "node": render_node.path(),
-                "image_data": image_data,
-                "image_size": image_size
+                "output_path": output_path,
+                "resolution": [resolution_x or "default", resolution_y or "default"],
+                "camera": camera_path or "default",
+                "image_data": encoded_image_data,
+                "image_size": len(image_data),
+                "render_time": "unknown"
             }
-            
-            print(f"Render function completed successfully, returning result with keys: {list(result.keys())}")
-            return result
+            '''
+            # Use MCP Image class correctly to package image for Claude:
+            from mcp.server.fastmcp import Image as MCPImage
+
+            mcp_image = MCPImage(data=base64.b64decode(encoded_image_data), format="jpg")
+
+            response["mcp_image"] = mcp_image  # <-- THIS is critical!
+            '''
+            return response
             
         except Exception as e:
-            print(f"Error in render_scene function: {str(e)}")
             traceback.print_exc()
-            raise Exception(f"Failed to render scene: {str(e)}")
+            return {"error": f"Failed to render scene: {str(e)}"}
+
+
+    def test_render(self):
+        """Return a test image to verify image communication is working"""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            import tempfile, os, time, base64
+            
+            # Create a simple test image
+            width, height = 400, 300
+            img = Image.new("RGB", (width, height), color=(240, 240, 240))
+            draw = ImageDraw.Draw(img)
+            
+            draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0), outline=(0, 0, 0))
+            draw.text((180, 100), "Test Render Image", fill=(0, 0, 0))
+            draw.text((180, 150), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0))
+            
+            # Save to temporary file
+            temp_file = os.path.join(tempfile.gettempdir(), f"test_render_{int(time.time())}.jpg")
+            img.save(temp_file, "JPEG")
+            
+            # Read and encode to base64
+            with open(temp_file, "rb") as f:
+                image_data = f.read()
+            encoded_image_data = base64.b64encode(image_data).decode('utf-8')
+            
+            return {
+                "rendered": True,
+                "output_path": temp_file,
+                "resolution": ["400", "300"],
+                "camera": "test",
+                "image_data": encoded_image_data,
+                "image_size": len(image_data),
+                "render_time": "0s"
+            }
+        except Exception as e:
+            return {"error": f"Failed to create test render: {str(e)}"}
 
 
 # UI Panel for Houdini
