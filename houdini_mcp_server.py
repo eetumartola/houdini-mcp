@@ -60,6 +60,7 @@ class HoudiniConnection:
                 self.sock = None
                 self._last_command_executed = False
     
+    
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Houdini and return the response"""
         # Try to connect if we don't have a valid connection
@@ -80,8 +81,11 @@ class HoudiniConnection:
             self.sock.sendall(command_json.encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
-            # Use a reasonable timeout
-            self.sock.settimeout(30.0)
+            # For render operations, use a much longer timeout
+            if command_type == "render_scene":
+                self.sock.settimeout(120.0)  # 2 minutes for render operations
+            else:
+                self.sock.settimeout(30.0)   # Default timeout for other operations
             
             # Receive data until we find a newline or complete JSON
             buffer = b''
@@ -151,7 +155,33 @@ class HoudiniConnection:
                         logger.error(f"Houdini error: {response.get('message')}")
                         raise Exception(response.get("message", "Unknown error from Houdini"))
                     
-                    return response.get("result", {})
+                    result = response.get("result", {})
+                    
+                    # Special handling for image data
+                    if "image_data" in result:
+                        if result["image_data"] is not None:
+                            # Log the size of binary data
+                            image_size = result.get("image_size", 0)
+                            logger.info(f"Image data received: {image_size} bytes")
+                            
+                            if isinstance(result["image_data"], str):
+                                # If it's already a string, it's likely already encoded
+                                logger.info("Image data is already a string, length: " + 
+                                            f"{len(result['image_data'])}")
+                            else:
+                                # Convert binary image data to base64 string
+                                import base64
+                                try:
+                                    encoded_data = base64.b64encode(result["image_data"]).decode('utf-8')
+                                    result["image_data"] = encoded_data
+                                    logger.info(f"Converted image data to base64, length: {len(encoded_data)}")
+                                except Exception as e:
+                                    logger.error(f"Error encoding image data: {str(e)}")
+                                    # Keep the image data as is if encoding fails
+                        else:
+                            logger.warning("Image data is None")
+                    
+                    return result
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON in response: {str(e)}")
                     logger.error(f"Raw data: {buffer.decode('utf-8', errors='replace')}")
@@ -171,7 +201,6 @@ class HoudiniConnection:
             if isinstance(e, socket.timeout) or isinstance(e, ConnectionError):
                 self.sock = None
             raise
-
 
 
 @asynccontextmanager
@@ -387,6 +416,46 @@ def delete_object(ctx: Context, path: str = None, name: str = None) -> str:
         return f"Error deleting object: {str(e)}"
 
 @mcp.tool()
+def copy_object(
+    ctx: Context,
+    source_path: str = None,
+    source_name: str = None,
+    new_name: str = None,
+    position_offset: List[float] = None
+) -> str:
+    """
+    Copy an existing object in the Houdini scene.
+    
+    Parameters:
+    - source_path: Full path of the object to copy
+    - source_name: Name of the object if path not provided
+    - new_name: Optional name for the new copy
+    - position_offset: Optional [x, y, z] offset from the original position
+    """
+    try:
+        if not source_path and not source_name:
+            return "Error: Either source_path or source_name must be provided"
+            
+        houdini = get_houdini_connection()
+        
+        params = {}
+        if source_path:
+            params["source_path"] = source_path
+        if source_name:
+            params["source_name"] = source_name
+        if new_name:
+            params["new_name"] = new_name
+        if position_offset:
+            params["position_offset"] = position_offset
+            
+        result = houdini.send_command("copy_object", params)
+        
+        return f"Copied object: {result.get('source')} → {result.get('name')} at path: {result.get('path')}"
+    except Exception as e:
+        logger.error(f"Error copying object: {str(e)}")
+        return f"Error copying object: {str(e)}"
+
+@mcp.tool()
 def set_material(
     ctx: Context,
     object_path: str = None,
@@ -449,15 +518,21 @@ def render_scene(
     ctx: Context,
     output_path: str = None,
     resolution_x: int = None,
-    resolution_y: int = None
-) -> str:
+    resolution_y: int = None,
+    camera_path: str = None,
+    image_name: str = None,
+    return_image: bool = True
+) -> Any:
     """
-    Render the current Houdini scene.
+    Render the current Houdini scene and optionally return the image.
     
     Parameters:
     - output_path: Optional path to save the rendered image
     - resolution_x: Optional horizontal resolution
     - resolution_y: Optional vertical resolution
+    - camera_path: Optional path to the camera to use for rendering
+    - image_name: Optional descriptive name for the rendered image
+    - return_image: If True, returns the rendered image as part of the response
     """
     try:
         houdini = get_houdini_connection()
@@ -469,12 +544,122 @@ def render_scene(
             params["resolution_x"] = resolution_x
         if resolution_y:
             params["resolution_y"] = resolution_y
+        if camera_path:
+            params["camera_path"] = camera_path
+        if image_name:
+            params["image_name"] = image_name
             
+        logger.info(f"Sending render_scene command with parameters: {params}")
         result = houdini.send_command("render_scene", params)
+        logger.info(f"Received render result with keys: {list(result.keys())}")
         
-        return f"Scene rendered successfully. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+        # Check if image data is available and return_image is requested
+        if return_image and "image_data" in result and result["image_data"]:
+            # Create an Image object from the binary data
+            try:
+                import base64
+                import io
+                from PIL import Image as PILImage
+                import inspect
+                import tempfile
+                import os
+                
+                # Add debugging information about the Image class
+                logger.info(f"MCP Image class expects type: {inspect.signature(Image.__init__)}")
+                
+                # Log the image data length for debugging
+                logger.info(f"Processing image data, length: {len(result['image_data'])}")
+                
+                # Convert binary data to image
+                img_data = result["image_data"]
+                if isinstance(img_data, str):
+                    # If it's a string, assume it's base64 encoded
+                    img_data = base64.b64decode(img_data)
+                
+                logger.info(f"Decoded image data, binary length: {len(img_data)}")
+                
+                # Create a BytesIO object from the binary data
+                img_buffer = io.BytesIO(img_data)
+                img_buffer.seek(0)
+                
+                # Open the image using PIL
+                img = PILImage.open(img_buffer)
+                logger.info(f"Successfully created PIL Image: format={img.format}, size={img.size}, mode={img.mode}")
+                logger.info(f"Current data type: {type(img)}")
+                
+                # Convert RGBA to RGB if needed
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                    logger.info("Converted image from RGBA to RGB")
+                
+                # Since MCP Image expects a file path, save to a temporary file first
+                temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                temp_path = temp_file.name
+                temp_file.close()  # Close the file so we can reopen it
+                
+                logger.info(f"Saving image to temporary file: {temp_path}")
+                img.save(temp_path, format="JPEG", quality=95)
+                
+                # Now create the MCP Image using the file path
+                logger.info(f"Creating MCP Image from path: {temp_path}")
+                mcp_image = Image(temp_path)
+                
+                logger.info("Successfully created MCP Image object")
+                
+                # Return both the image and render info
+                result_obj = {
+                    "message": f"Scene rendered successfully. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}",
+                    "image": mcp_image
+                }
+                
+                # Schedule the temporary file for deletion
+                # We can't delete it immediately as it's still being used
+                def cleanup_temp_file():
+                    try:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                            logger.info(f"Deleted temporary file: {temp_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete temporary file {temp_path}: {str(e)}")
+                
+                # Start a thread to clean up after a delay
+                import threading
+                cleanup_thread = threading.Timer(60.0, cleanup_temp_file)  # Clean up after 60 seconds
+                cleanup_thread.daemon = True
+                cleanup_thread.start()
+                
+                return result_obj
+            
+            except Exception as e:
+                logger.error(f"Error processing image data: {str(e)}")
+                # Include the traceback for better debugging
+                import traceback
+                logger.error(traceback.format_exc())
+                
+                # Fall back to text response if image processing fails
+                return f"Scene rendered successfully (but image processing failed: {str(e)}). Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+        else:
+            # Provide information about why the image wasn't returned
+            if not return_image:
+                logger.info("Image return was disabled by parameter")
+                return f"Scene rendered successfully (image return disabled). Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+            elif "image_data" not in result:
+                logger.warning("No image_data found in the render result")
+                return f"Scene rendered successfully, but no image data was returned from Houdini. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+            elif not result["image_data"]:
+                logger.warning("image_data is empty in the render result")
+                return f"Scene rendered successfully, but the image data is empty. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+            else:
+                # This case shouldn't be reached but is here for completeness
+                logger.warning("Unknown reason for not processing image")
+                return f"Scene rendered successfully. Output: {result.get('output_path')}, Resolution: {result.get('resolution')}"
+    except ConnectionError as e:
+        logger.error(f"Connection error: {str(e)}")
+        return f"Error rendering scene: Connection to Houdini failed: {str(e)}"
     except Exception as e:
         logger.error(f"Error rendering scene: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return f"Error rendering scene: {str(e)}"
 
 @mcp.prompt()
@@ -492,7 +677,8 @@ def asset_creation_strategy() -> str:
     3. For modifying existing objects:
        - Use modify_object() with the path or name of the object
        - Set translation, rotation, or scale as needed
-       
+       - Use copy_object() to clone existing objects
+
     4. For adding materials:
        - Use set_material() to apply colors or materials
        - Remember that Houdini uses a node-based material system

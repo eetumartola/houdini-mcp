@@ -17,6 +17,14 @@ import logging
 logging.basicConfig(level=logging.DEBUG, 
                   format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("HoudiniMCPServer")
+    
+class BinaryDataEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles binary data by converting to base64"""
+    def default(self, obj):
+        import base64
+        if isinstance(obj, bytes):
+            return base64.b64encode(obj).decode('utf-8')
+        return super().default(obj)
 
 class HoudiniMCPServer:
     def __init__(self, host='localhost', port=9876):
@@ -223,7 +231,7 @@ class HoudiniMCPServer:
                             "status": "error",
                             "message": f"Invalid JSON format: {str(e)}"
                         })
-                    
+
     def _command_processor(self):
         """Thread that processes commands from the queue"""
         print("Command processor thread started")
@@ -265,7 +273,8 @@ class HoudiniMCPServer:
                 time.sleep(1)  # Prevent rapid failure loops
         
         print("Command processor thread stopped")
-    
+
+
     def _send_response(self, client_id, response):
         """Send response to client"""
         try:
@@ -276,8 +285,18 @@ class HoudiniMCPServer:
                 
                 client_info = self.clients[client_id]
             
-            # Prepare response
-            response_json = json.dumps(response) + "\n"  # Always add newline delimiter
+            # Check for binary data in the response
+            has_binary = False
+            if "result" in response and isinstance(response["result"], dict):
+                has_binary = "image_data" in response["result"] and isinstance(response["result"]["image_data"], bytes)
+            
+            # Prepare response with appropriate encoder
+            if has_binary:
+                logger.info("Response contains binary data, using custom encoder")
+                response_json = json.dumps(response, cls=BinaryDataEncoder) + "\n"
+            else:
+                response_json = json.dumps(response) + "\n"
+            
             response_bytes = response_json.encode('utf-8')
             
             logger.info(f"Sending response ({len(response_bytes)} bytes) to {client_info['address']}")
@@ -379,6 +398,7 @@ class HoudiniMCPServer:
                 "get_scene_info": self.get_scene_info,
                 "get_object_info": self.get_object_info,
                 "modify_object": self.modify_object,
+                "copy_object": self.copy_object,  
                 "delete_object": self.delete_object,
                 "execute_code": self.execute_code,
                 "set_material": self.set_material,
@@ -472,9 +492,11 @@ class HoudiniMCPServer:
             
             # Set position if provided
             if position and len(position) == 3:
-                # In Houdini, we typically set the node position in the network editor
-                # This doesn't affect the 3D position of the object
-                pass
+                translate_parm = new_node.parmTuple("t")
+                if translate_parm:
+                    translate_parm[0].set(float(position[0]))
+                    translate_parm[1].set(float(position[1]))
+                    translate_parm[2].set(float(position[2]))
                     
             # For geometry nodes, add the appropriate primitives
             if type == "geo":
@@ -483,11 +505,15 @@ class HoudiniMCPServer:
                     raise ValueError(f"Failed to create geometry node: {name}")
                 
                 # Add a primitive inside the geo node based on requested type
-                inside_node = geo_node.createNode(primitive_type)  # Use primitive_type parameter
+                inside_node = geo_node.createNode(primitive_type)
                 
                 # Connect to output
                 output_node = geo_node.createNode("output")
                 output_node.setInput(0, inside_node)
+                
+                # Set display flag on the output node for consistent behavior
+                inside_node.setDisplayFlag(False)
+                output_node.setDisplayFlag(True)
                 
                 # Layout the network for cleanliness
                 geo_node.layoutChildren()
@@ -512,7 +538,6 @@ class HoudiniMCPServer:
             if path:
                 node = hou.node(path)
             elif name:
-                # Search in /obj context
                 obj_context = hou.node("/obj")
                 for child in obj_context.children():
                     if child.name() == name:
@@ -522,69 +547,30 @@ class HoudiniMCPServer:
             if not node:
                 raise ValueError(f"Object not found: {path or name}")
             
-            # Get the geometry node for editing
-            geo_node = None
-            if node.type().name() == "geo":
-                # It's already a geometry node
-                geo_node = node
-            elif node.type().name() == "subnet":
-                # For subnets, we need to find geometry inside
-                for child in node.children():
-                    if child.type().name() == "geo":
-                        geo_node = child
-                        break
+            # Apply transformations directly to the object node
+            if translate:
+                translate_parm = node.parmTuple("t")
+                if translate_parm:
+                    translate_parm[0].set(float(translate[0]))
+                    translate_parm[1].set(float(translate[1]))
+                    translate_parm[2].set(float(translate[2]))
             
-            # Apply transform if geometry node is found
-            if geo_node:
-                # For Houdini, we use a transform SOP to modify geometry
-                # Find existing transform SOP or create a new one
-                transform_node = None
-                for child in geo_node.children():
-                    if child.type().name() == "xform":
-                        transform_node = child
-                        break
-                
-                if not transform_node:
-                    # Find the first and last nodes in the network
-                    out_node = None
-                    in_node = None
-                    
-                    for child in geo_node.children():
-                        if child.type().name() == "output":
-                            out_node = child
-                        elif not child.inputs() and child.type().name() not in ["output", "xform"]:
-                            in_node = child
-                    
-                    if in_node and out_node:
-                        # Create transform node between input and output
-                        transform_node = geo_node.createNode("xform")
-                        transform_node.setInput(0, in_node)
-                        out_node.setInput(0, transform_node)
-                        geo_node.layoutChildren()
-                
-                # Apply transformations if transform node exists
-                if transform_node:
-                    parms = transform_node.parmTuple("t")
-                    if translate and parms:
-                        parms[0].set(float(translate[0]))
-                        parms[1].set(float(translate[1]))
-                        parms[2].set(float(translate[2]))
-                    
-                    parms = transform_node.parmTuple("r")
-                    if rotate and parms:
-                        parms[0].set(float(rotate[0]))
-                        parms[1].set(float(rotate[1]))
-                        parms[2].set(float(rotate[2]))
-                    
-                    parms = transform_node.parmTuple("s")
-                    if scale and parms:
-                        parms[0].set(float(scale[0]))
-                        parms[1].set(float(scale[1]))
-                        parms[2].set(float(scale[2]))
+            if rotate:
+                rotate_parm = node.parmTuple("r")
+                if rotate_parm:
+                    rotate_parm[0].set(float(rotate[0]))
+                    rotate_parm[1].set(float(rotate[1]))
+                    rotate_parm[2].set(float(rotate[2]))
+            
+            if scale:
+                scale_parm = node.parmTuple("s")
+                if scale_parm:
+                    scale_parm[0].set(float(scale[0]))
+                    scale_parm[1].set(float(scale[1]))
+                    scale_parm[2].set(float(scale[2]))
             
             # Handle visibility
             if visible is not None:
-                # In Houdini, visibility is typically controlled by the display flag
                 node.setDisplayFlag(visible)
                 node.setRenderFlag(visible)
             
@@ -598,6 +584,7 @@ class HoudiniMCPServer:
             print(f"Error in modify_object: {str(e)}")
             traceback.print_exc()
             raise Exception(f"Failed to modify object: {str(e)}")
+
 
     def delete_object(self, path=None, name=None):
         """Delete an object from the scene"""
@@ -644,7 +631,6 @@ class HoudiniMCPServer:
             if path:
                 node = hou.node(path)
             elif name:
-                # Search in /obj context
                 obj_context = hou.node("/obj")
                 for child in obj_context.children():
                     if child.name() == name:
@@ -659,7 +645,7 @@ class HoudiniMCPServer:
                 "name": node.name(),
                 "path": node.path(),
                 "type": node.type().name(),
-                "is_displayed": node.isDisplayed(),
+                "is_displayed": node.isDisplayFlagSet(),  # Corrected method name
                 "is_rendered": node.isRenderFlagSet(),
                 "children_count": len(node.children()),
                 "parameters": {}
@@ -769,36 +755,51 @@ class HoudiniMCPServer:
                     material_node = child
                     break
             
+            # Find the display node and output node
+            display_node = None
+            output_node = None
+            
+            for child in node.children():
+                if child.isDisplayFlagSet():
+                    display_node = child
+                if child.type().name() == "output":
+                    output_node = child
+            
             if not material_node:
                 # Find where to insert the material node
-                out_node = None
                 in_node = None
                 
-                for child in node.children():
-                    if child.type().name() == "output":
-                        out_node = child
-                        if out_node.inputs() and out_node.inputs()[0]:
-                            in_node = out_node.inputs()[0]
+                if output_node and output_node.inputs() and output_node.inputs()[0]:
+                    in_node = output_node.inputs()[0]
                 
-                if out_node:
+                if output_node:
                     # Create material node
                     material_node = node.createNode("material")
                     
                     # Connect it to the network
                     if in_node:
                         material_node.setInput(0, in_node)
-                        out_node.setInput(0, material_node)
+                        output_node.setInput(0, material_node)
                     else:
-                        out_node.setInput(0, material_node)
+                        output_node.setInput(0, material_node)
                     
                     # Layout the node for cleanliness
                     node.layoutChildren()
             
             # Set the material path on the material node
             if material_node:
-                material_path_parm = material_node.parm("shop_materialpath")
+                material_path_parm = material_node.parm("shop_materialpath1")
                 if material_path_parm:
                     material_path_parm.set(material.path())
+            
+            # Update the display flag to show the material
+            if display_node:
+                display_node.setDisplayFlag(False)
+            
+            if material_node:
+                material_node.setDisplayFlag(True)
+            elif output_node:
+                output_node.setDisplayFlag(True)
             
             return {
                 "object": node.name(),
@@ -811,75 +812,323 @@ class HoudiniMCPServer:
             traceback.print_exc()
             raise Exception(f"Failed to set material: {str(e)}")
 
-    def render_scene(self, output_path=None, resolution_x=None, resolution_y=None):
+    def copy_object(self, source_path=None, source_name=None, new_name=None, position_offset=None):
+        """Copy an existing object in the scene"""
+        try:
+            # Find the source node by path or name
+            source_node = None
+            
+            if source_path:
+                source_node = hou.node(source_path)
+            elif source_name:
+                obj_context = hou.node("/obj")
+                for child in obj_context.children():
+                    if child.name() == source_name:
+                        source_node = child
+                        break
+            
+            if not source_node:
+                raise ValueError(f"Source object not found: {source_path or source_name}")
+            
+            # Get the parent of the source node
+            parent_node = source_node.parent()
+            
+            # Generate a new name if none provided
+            if not new_name:
+                base_name = source_node.name()
+                # Find a unique name
+                i = 1
+                while True:
+                    new_name = f"{base_name}_{i}"
+                    if not parent_node.node(new_name):
+                        break
+                    i += 1
+            
+            # Copy the node
+            new_node = source_node.copyTo(parent_node)
+            new_node.setName(new_name)
+            
+            # Apply position offset if provided
+            if position_offset and len(position_offset) == 3:
+                # Get current position
+                translate_parm = new_node.parmTuple("t")
+                if translate_parm:
+                    current_pos = [translate_parm[0].eval(), translate_parm[1].eval(), translate_parm[2].eval()]
+                    # Apply offset
+                    translate_parm[0].set(current_pos[0] + float(position_offset[0]))
+                    translate_parm[1].set(current_pos[1] + float(position_offset[1]))
+                    translate_parm[2].set(current_pos[2] + float(position_offset[2]))
+            
+            # Update the internal network if it's a geometry node
+            if new_node.type().name() == "geo":
+                for child in new_node.children():
+                    if child.type().name() == "output":
+                        # Ensure the display flag is set correctly on the output node
+                        child.setDisplayFlag(True)
+            
+            # Get the position for reporting
+            position = None
+            translate_parm = new_node.parmTuple("t")
+            if translate_parm:
+                position = [
+                    translate_parm[0].eval(),
+                    translate_parm[1].eval(),
+                    translate_parm[2].eval()
+                ]
+            
+            return {
+                "name": new_node.name(),
+                "path": new_node.path(),
+                "type": new_node.type().name(),
+                "source": source_node.name(),
+                "position": position
+            }
+        except Exception as e:
+            print(f"Error in copy_object: {str(e)}")
+            traceback.print_exc()
+            raise Exception(f"Failed to copy object: {str(e)}")
+
+    def render_scene(self, output_path=None, resolution_x=None, resolution_y=None, camera_path=None, image_name=None):
         """Render the current scene"""
         try:
-            # Get the current ROP (Render Operator) node
-            # Typically this would be a Mantra node for rendering
-            rop_node = None
+            print("Starting render process...")
+            
+            # Look for Mantra or other render nodes in /out
+            render_node = None
             out_context = hou.node("/out")
             
             if out_context:
-                # Look for Mantra or other render nodes
                 for child in out_context.children():
                     if child.type().name() in ["ifd", "opengl"]:
-                        rop_node = child
+                        render_node = child
+                        print(f"Found existing render node: {render_node.path()}")
                         break
+                        
+                if not render_node:
+                    render_node = out_context.createNode("ifd", "render_mcp")
+                    print(f"Created new render node: {render_node.path()}")
+            else:
+                raise ValueError("Could not find /out context")
             
-            # Create a Mantra ROP if none exists
-            if not rop_node and out_context:
-                rop_node = out_context.createNode("ifd", "mantra_render")
-            
-            if not rop_node:
-                raise ValueError("Could not find or create a render node")
-            
-            # Set resolution if provided
-            if resolution_x is not None:
-                res_parm = rop_node.parm("res_override")
-                if res_parm:
-                    res_parm.set(1)  # Enable resolution override
+            # Step 2: Prepare the output path
+            final_output_path = output_path
+            if not final_output_path:
+                # Create a descriptive filename
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                scene_name = hou.hipFile.basename().split('.')[0]
                 
-                res_x = rop_node.parm("res_overridex")
-                if res_x:
-                    res_x.set(int(resolution_x))
-            
-            if resolution_y is not None:
-                res_parm = rop_node.parm("res_override")
-                if res_parm:
-                    res_parm.set(1)  # Enable resolution override
+                filename = f"{scene_name}_{'custom' if image_name else 'render'}_{timestamp}.jpg"
+                if image_name:
+                    filename = f"{scene_name}_{image_name}_{timestamp}.jpg"
                 
-                res_y = rop_node.parm("res_overridey")
-                if res_y:
-                    res_y.set(int(resolution_y))
+                # Use the Houdini project directory
+                hip_dir = os.path.dirname(hou.hipFile.path())
+                render_dir = os.path.join(hip_dir, "renders")
+                
+                # Create the render directory if it doesn't exist
+                if not os.path.exists(render_dir):
+                    os.makedirs(render_dir)
+                    
+                final_output_path = os.path.join(render_dir, filename)
+                final_output_path = os.path.normpath(final_output_path)
+                print(f"Generated output path: {final_output_path}")
+            else:
+                # Ensure the extension is jpg if not specified
+                if not final_output_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    final_output_path = f"{final_output_path}.jpg"
+                final_output_path = os.path.normpath(final_output_path)
+                print(f"Using provided output path: {final_output_path}")
             
-            # Set output path if provided
-            if output_path:
-                out_parm = rop_node.parm("vm_picture")
-                if out_parm:
-                    out_parm.set(output_path)
+            # Step 3: Configure resolution
+            if resolution_x is not None and resolution_y is not None:
+                print(f"Setting resolution to {resolution_x}x{resolution_y}")
+                res_override = render_node.parm("res_override")
+                if res_override:
+                    res_override.set(1)
+                    
+                    x_res = render_node.parm("res_overridex")
+                    if x_res:
+                        x_res.set(int(resolution_x))
+                    
+                    y_res = render_node.parm("res_overridey")
+                    if y_res:
+                        y_res.set(int(resolution_y))
             
-            # Render the scene
-            rop_node.render()
+            # Step 4: Configure camera
+            selected_camera = None
+            if camera_path:
+                camera_parm = render_node.parm("camera")
+                if camera_parm:
+                    camera_parm.set(camera_path)
+                    selected_camera = camera_path
+                    print(f"Using specified camera: {camera_path}")
+            else:
+                # Find a camera
+                obj_context = hou.node("/obj")
+                if obj_context:
+                    for node in obj_context.children():
+                        if node.type().name() in ["cam", "camera"]:
+                            camera_parm = render_node.parm("camera")
+                            if camera_parm:
+                                camera_parm.set(node.path())
+                                selected_camera = node.path()
+                                print(f"Found and using camera: {node.path()}")
+                                break
             
-            # Get the actual output path
-            actual_path = output_path
-            if not actual_path:
-                out_parm = rop_node.parm("vm_picture")
-                if out_parm:
-                    actual_path = out_parm.eval()
+            # Step 5: Set output path and format
+            picture_parm = render_node.parm("vm_picture")
+            if picture_parm:
+                picture_parm.set(final_output_path)
+                print(f"Set output path parameter to: {final_output_path}")
+                
+            # Configure JPEG output if it's a Mantra node
+            if render_node.type().name() == "ifd":
+                jpeg_enable = render_node.parm("vm_image_jpeg_enable")
+                if jpeg_enable:
+                    jpeg_enable.set(1)
+                    print("Enabled JPEG output")
+                    
+                jpeg_quality = render_node.parm("vm_image_jpeg_quality")
+                if jpeg_quality:
+                    jpeg_quality.set(95)
+                    print("Set JPEG quality to 95")
             
-            # Get the actual resolution
-            actual_res_x = rop_node.parm("res_overridex").eval() if rop_node.parm("res_overridex") else "default"
-            actual_res_y = rop_node.parm("res_overridey").eval() if rop_node.parm("res_overridey") else "default"
+            # Set output mode
+            output_mode = render_node.parm("soho_outputmode")
+            if output_mode:
+                output_mode.set(0)
+                print("Set output mode to 'Output to Disk'")
             
-            return {
+            # Step 6: Render with timing
+            print(f"Starting render with node: {render_node.path()}")
+            render_start_time = time.time()
+            
+            # Try to use blocking render if available
+            try:
+                render_node.render(block=True)
+            except TypeError:
+                # Fall back to standard render if blocking parameter isn't supported
+                render_node.render()
+                
+            render_duration = time.time() - render_start_time
+            print(f"Render function returned after {render_duration:.2f} seconds")
+            
+            # Check if Houdini reports rendering is still in progress
+            try:
+                is_rendering = render_node.isRendering()
+                if is_rendering:
+                    print("Warning: Houdini reports rendering is still in progress even though render() call returned")
+                    
+                    # Wait for rendering to complete if Houdini provides an API for it
+                    wait_count = 0
+                    while is_rendering and wait_count < 120:  # Wait up to 2 minutes more
+                        time.sleep(2)
+                        wait_count += 2
+                        is_rendering = render_node.isRendering()
+                        if wait_count % 10 == 0:
+                            print(f"Still waiting for rendering to complete... ({wait_count} seconds)")
+                    
+                    if is_rendering:
+                        print("Warning: Rendering still in progress after extended wait")
+                    else:
+                        print(f"Rendering completed after additional {wait_count} seconds")
+            except AttributeError:
+                print("Render node doesn't support isRendering() method, continuing with file check")
+            
+            # Step 7: Collect results
+            actual_res_x = "default"
+            actual_res_y = "default"
+            x_res_parm = render_node.parm("res_overridex")
+            y_res_parm = render_node.parm("res_overridey")
+            
+            if x_res_parm and y_res_parm:
+                actual_res_x = x_res_parm.eval()
+                actual_res_y = y_res_parm.eval()
+            
+            # Step 8: Wait for and read the image data with extended timeout
+            image_data = None
+            image_size = 0
+            
+            # Set a longer wait time based on the render duration
+            max_wait_time = max(60, render_duration * 2)  # At least 60 seconds or 2x render time
+            wait_interval = 1.0  # Check once per second
+            
+            print(f"Waiting up to {max_wait_time:.0f} seconds for rendered image to be available at {final_output_path}...")
+            start_wait = time.time()
+            
+            # Track file changes to better understand filesystem behavior
+            last_modified_time = 0
+            last_size = 0
+            stable_count = 0
+            
+            while time.time() - start_wait < max_wait_time:
+                if os.path.exists(final_output_path):
+                    try:
+                        current_size = os.path.getsize(final_output_path)
+                        current_modified = os.path.getmtime(final_output_path)
+                        
+                        # Report changes
+                        if current_size != last_size:
+                            print(f"File size changed: {last_size} -> {current_size} bytes")
+                            last_size = current_size
+                            stable_count = 0
+                        elif current_size > 0:
+                            stable_count += 1
+                            
+                        if current_modified != last_modified_time:
+                            print(f"File modified time changed: {time.ctime(current_modified)}")
+                            last_modified_time = current_modified
+                            stable_count = 0
+                        
+                        # If file size is stable and non-zero for several checks, consider it complete
+                        if current_size > 0 and stable_count >= 3:
+                            print(f"File size stable at {current_size} bytes for {stable_count} checks, assuming render complete")
+                            break
+                    
+                    except (OSError, IOError) as e:
+                        print(f"Error checking file: {str(e)}, will retry...")
+                        # Continue with the wait loop
+                
+                time.sleep(wait_interval)
+            
+            # Final attempt to read the file after waiting
+            if os.path.exists(final_output_path):
+                try:
+                    file_size = os.path.getsize(final_output_path)
+                    print(f"Rendered image exists: {final_output_path}, size: {file_size} bytes")
+                    
+                    if file_size > 0:
+                        # Add a small additional delay to ensure file is fully written
+                        time.sleep(1.0)
+                        
+                        with open(final_output_path, 'rb') as f:
+                            image_data = f.read()
+                        image_size = len(image_data)
+                        print(f"Successfully read {image_size} bytes of image data")
+                    else:
+                        print("Warning: Rendered image file exists but is empty")
+                except Exception as e:
+                    print(f"Error reading image file: {str(e)}")
+                    traceback.print_exc()
+            else:
+                print(f"Warning: Rendered image file not found at {final_output_path} after waiting {max_wait_time:.0f} seconds")
+            
+            # Step 9: Return results
+            result = {
                 "rendered": True,
-                "output_path": actual_path if actual_path else "[not saved]",
+                "output_path": final_output_path,
                 "resolution": [actual_res_x, actual_res_y],
-                "node": rop_node.path()
+                "camera": selected_camera,
+                "node": render_node.path(),
+                "image_data": image_data,
+                "image_size": image_size
             }
+            
+            print(f"Render function completed successfully, returning result with keys: {list(result.keys())}")
+            return result
+            
         except Exception as e:
-            print(f"Error in render_scene: {str(e)}")
+            print(f"Error in render_scene function: {str(e)}")
             traceback.print_exc()
             raise Exception(f"Failed to render scene: {str(e)}")
 
