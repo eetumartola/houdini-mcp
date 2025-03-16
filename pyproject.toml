@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "houdini-mcp"
+version = "0.1.0"
+description = "Connect Houdini to Claude AI through MCP protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Eetu Martola", email = "your.email@example.com" }
+    { name = "siddharth ahuja", email = "your.email@example.com" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+    "fastmcp>=0.2.0",
+    "uvicorn>=0.27.0",
+    "logging>=0.4.9.6",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/eetumartola/houdini-mcp"
+"Bug Tracker" = "https://github.com/eetumartola/houdini-mcp/issues"
+
+[project.scripts]
+houdini-mcp = "houdini_mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["houdini_mcp_server.py"]
