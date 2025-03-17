@@ -655,7 +655,6 @@ class HoudiniMCPServer:
                 "path": node.path(),
                 "type": node.type().name(),
                 "is_displayed": node.isDisplayFlagSet(),  # Corrected method name
-                "is_rendered": node.isRenderFlagSet(),
                 "children_count": len(node.children()),
                 "parameters": {}
             }
@@ -897,11 +896,12 @@ class HoudiniMCPServer:
             traceback.print_exc()
             raise Exception(f"Failed to copy object: {str(e)}")
 
+
     def render_scene(
         self,
         output_path=None,
-        resolution_x=None,
-        resolution_y=None,
+        resolution_x=640,
+        resolution_y=480,
         camera_path=None,
         image_name=None
     ):
@@ -920,15 +920,50 @@ class HoudiniMCPServer:
                 if not os.path.exists(render_dir):
                     os.makedirs(render_dir)
                 output_path = os.path.join(render_dir, f"render_{timestamp}.jpg")
-            else:
-                output_path = output_path
+            
+            # Set resolution parameters
+            if resolution_x and resolution_y:
+                render_node.parm("tres").set(1)
+                render_node.parm("res1").set(resolution_x)
+                render_node.parm("res2").set(resolution_y)
             
             picture_parm = render_node.parm("picture")
             picture_parm.set(output_path)
+            
+            # Find a camera if none was specified
+            used_camera_path = camera_path
+            if not camera_path:
+                # Check for cameras in the scene
+                obj_context = hou.node("/obj")
+                cameras = []
+                
+                # First look for cam nodes
+                for node in obj_context.children():
+                    if node.type().name() == "cam":
+                        cameras.append(node.path())
+                
+                # If no dedicated cameras found, look for default perspective view camera
+                if not cameras and hou.ui:
+                    try:
+                        # Try to get the perspective view camera path
+                        perspective_cam = "/obj/PERSPECTIVE"
+                        if hou.node(perspective_cam):
+                            cameras.append(perspective_cam)
+                    except:
+                        pass
+                
+                # Use the first camera we found, if any
+                if cameras:
+                    used_camera_path = cameras[0]
+                    logger.info(f"Automatically selected camera: {used_camera_path}")
+                else:
+                    logger.warning("No camera found in scene, using default view")
+            
+            # Set the camera parameter
             camera_parm = render_node.parm("camera")
-            camera_parm.set(camera_path)
-            #render_node.parm("picture_format").set(0)  # Set JPEG format
-
+            if used_camera_path:
+                camera_parm.set(used_camera_path)
+            
             # Execute render
             render_start = time.time()
             render_node.render()
@@ -946,68 +981,22 @@ class HoudiniMCPServer:
             with open(output_path, "rb") as f:
                 image_data = f.read()
 
-            encoded_image_data = base64.b64encode(image_data).decode('utf-8')
-
-            # Construct response with MCP-compatible Image object explicitly
+            # Construct response
             response = {
                 "rendered": True,
                 "output_path": output_path,
                 "resolution": [resolution_x or "default", resolution_y or "default"],
-                "camera": camera_path or "default",
-                "image_data": encoded_image_data,
+                "camera": used_camera_path or "default view",
+                "image_data": image_data,  # Let the BinaryDataEncoder handle this
                 "image_size": len(image_data),
-                "render_time": "unknown"
+                "render_time": f"{render_duration:.2f}s"
             }
-            '''
-            # Use MCP Image class correctly to package image for Claude:
-            from mcp.server.fastmcp import Image as MCPImage
-
-            mcp_image = MCPImage(data=base64.b64decode(encoded_image_data), format="jpg")
-
-            response["mcp_image"] = mcp_image  # <-- THIS is critical!
-            '''
-            return response
             
+            return response
+                
         except Exception as e:
             traceback.print_exc()
             return {"error": f"Failed to render scene: {str(e)}"}
-
-
-    def test_render(self):
-        """Return a test image to verify image communication is working"""
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-            import tempfile, os, time, base64
-            
-            # Create a simple test image
-            width, height = 400, 300
-            img = Image.new("RGB", (width, height), color=(240, 240, 240))
-            draw = ImageDraw.Draw(img)
-            
-            draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0), outline=(0, 0, 0))
-            draw.text((180, 100), "Test Render Image", fill=(0, 0, 0))
-            draw.text((180, 150), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0))
-            
-            # Save to temporary file
-            temp_file = os.path.join(tempfile.gettempdir(), f"test_render_{int(time.time())}.jpg")
-            img.save(temp_file, "JPEG")
-            
-            # Read and encode to base64
-            with open(temp_file, "rb") as f:
-                image_data = f.read()
-            encoded_image_data = base64.b64encode(image_data).decode('utf-8')
-            
-            return {
-                "rendered": True,
-                "output_path": temp_file,
-                "resolution": ["400", "300"],
-                "camera": "test",
-                "image_data": encoded_image_data,
-                "image_size": len(image_data),
-                "render_time": "0s"
-            }
-        except Exception as e:
-            return {"error": f"Failed to create test render: {str(e)}"}
 
 
 # UI Panel for Houdini

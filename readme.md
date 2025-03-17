@@ -149,7 +149,7 @@ Here are some examples of what you can ask Claude to do:
 
 ### Communication Protocol
 
-The system uses a simple JSON-based protocol over TCP sockets:
+The system uses a simple JSON-based protocol over TCP sockets
 
 
 ### Houdini Implementation Notes
@@ -162,9 +162,9 @@ Unlike Blender, Houdini doesn't have a built-in event loop, so we use a separate
 - Complex operations might need to be broken down into smaller steps.
 - This implementation has limited error handling - always save your work before using it for complex tasks.
 
-## Contributing
+## Acknowledgements
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+This was originally based on ahujasid's blender-mcp https://github.com/ahujasid/blender-mcp/
 
 ## Disclaimer
 

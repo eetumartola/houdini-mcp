@@ -215,17 +215,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
         logger.info("HoudiniMCP server starting up")
         
-        # Start HTTP file server to serve rendered/test images from E:/MCP
-        rendered_dir = "E:/MCP"
-        if not os.path.exists(rendered_dir):
-            os.makedirs(rendered_dir)
-        try:
-            from file_server import start_file_server
-            httpd, http_thread = start_file_server(rendered_dir, port=8000)
-            logger.info(f"HTTP file server started on port 8000 serving {rendered_dir}")
-        except Exception as e:
-            logger.error(f"Failed to start HTTP file server: {str(e)}")
-        
         try:
             houdini = get_houdini_connection()
             logger.info("Successfully connected to Houdini on startup")
@@ -235,11 +224,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         
         yield {}
     finally:
-        try:
-            httpd.shutdown()
-            logger.info("HTTP file server shutdown")
-        except Exception as e:
-            logger.error(f"Error shutting down HTTP file server: {str(e)}")
         global _houdini_connection
         if _houdini_connection:
             logger.info("Disconnecting from Houdini on shutdown")
@@ -541,13 +525,14 @@ def execute_houdini_code(ctx: Context, code: str) -> str:
 def render_scene(
     ctx: Context,
     output_path: str = None,
-    resolution_x: int = None,
-    resolution_y: int = None,
+    resolution_x: int = 640,  # Default to smaller resolution
+    resolution_y: int = 480,  # Default to smaller resolution
     camera_path: str = None,
     image_name: str = None
 ) -> Any:
     """
     Render the current Houdini scene and return the result as an MCP Image object.
+    Uses smaller default resolutions (640x480) for faster rendering and display.
     """
     try:
         houdini = get_houdini_connection()
@@ -597,14 +582,10 @@ def render_scene(
                 
                 # Create and return an MCP Image object
                 image = MCPImage(path=img_path)
-                logger.info("Successfully created MCPImage object")
-                
                 return image
                 
             except Exception as img_err:
                 logger.error(f"Error handling image data: {str(img_err)}")
-                import traceback
-                logger.error(traceback.format_exc())
                 return {
                     "error": f"Failed to process image data: {str(img_err)}"
                 }
@@ -615,152 +596,17 @@ def render_scene(
             "render_info": {
                 "output_path": result.get('output_path', 'unknown'),
                 "resolution": result.get('resolution', ['unknown', 'unknown']),
-                "camera": result.get('camera', 'default'),
-                "available_keys": list(result.keys())
+                "camera": result.get('camera', 'default')
             }
         }
 
     except Exception as e:
         logger.error(f"Error rendering scene: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
         return {
             "error": f"Error rendering scene: {str(e)}"
         }
 
-@mcp.tool()
-def diagnose_image_handling(ctx: Context) -> Any:
-    try:
-        import tempfile, os, time, base64
-        from PIL import Image as PILImage, ImageDraw, ImageFont
 
-        # Create a simple test image with text and shapes
-        width, height = 800, 600
-        img = PILImage.new("RGB", (width, height), color=(240, 240, 240))
-        draw = ImageDraw.Draw(img)
-        
-        draw.rectangle([(50, 50), (200, 200)], fill=(255, 0, 0), outline=(0, 0, 0))
-        draw.ellipse([(300, 100), (500, 300)], fill=(0, 255, 0), outline=(0, 0, 0))
-        draw.polygon([(600, 50), (700, 200), (500, 200)], fill=(0, 0, 255), outline=(0, 0, 0))
-        
-        try:
-            font = ImageFont.truetype("arial.ttf", 36)
-        except IOError:
-            font = ImageFont.load_default()
-        draw.text((200, 400), "Houdini MCP Test Image", fill=(0, 0, 0), font=font)
-        draw.text((150, 450), "Red square, Green circle, Blue triangle", fill=(0, 0, 0), font=font)
-        draw.text((250, 500), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0), font=font)
-        
-        # Save the image to a temporary file
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, "houdini_mcp_test_image.jpg")
-        img.save(temp_path, format="JPEG", quality=95)
-        
-        # Open the file and encode the image data in base64
-        with open(temp_path, "rb") as f:
-            image_data = f.read()
-        encoded_image = base64.b64encode(image_data).decode("utf-8")
-        
-        return {
-            "message": "This is a test image created to diagnose image handling. "
-                       "If Claude can see this image, it should be able to describe these elements.",
-            "image": {
-                "data": encoded_image,
-                "format": "jpg",
-                "filename": os.path.basename(temp_path)
-            }
-        }
-    except Exception as e:
-        import traceback
-        logger.error(f"Error in diagnose_image_handling: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-@mcp.tool()
-def simple_image_diagnostics(ctx: Context) -> Any:
-    try:
-        import tempfile, os, base64
-        from PIL import Image as PILImage, ImageDraw, ImageFont
-
-        # Create a simple test image
-        width, height = 400, 300
-        img = PILImage.new("RGB", (width, height), color=(255, 255, 255))
-        draw = ImageDraw.Draw(img)
-        
-        # Draw a red rectangle
-        draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0))
-        
-        try:
-            font = ImageFont.truetype("arial.ttf", 20)
-        except IOError:
-            font = ImageFont.load_default()
-        draw.text((180, 100), "Test Image", fill=(0, 0, 0), font=font)
-        
-        # Save the image to a temporary file
-        temp_file = os.path.join(tempfile.gettempdir(), "simple_test.jpg")
-        img.save(temp_file, "JPEG")
-        
-        # Read and encode the file to base64
-        with open(temp_file, "rb") as f:
-            img_data = f.read()
-        encoded_image = base64.b64encode(img_data).decode("utf-8")
-        
-        return {
-            "message": "Created a simple test image",
-            "image": {
-                "data": encoded_image,
-                "format": "jpg",
-                "filename": os.path.basename(temp_file)
-            },
-            "file_path": temp_file,
-            "file_size": len(img_data),
-            "dimensions": f"{width}x{height}"
-        }
-    except Exception as e:
-        import traceback
-        logger.error(f"Error in simple_image_diagnostics: {str(e)}")
-        logger.error(traceback.format_exc())
-        return f"Error creating simple test image: {str(e)}"
-
-
-def test_render(self):
-    """Return a test image to verify image communication is working"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        import tempfile, os, time, base64
-        
-        # Create a simple test image
-        width, height = 400, 300
-        img = Image.new("RGB", (width, height), color=(240, 240, 240))
-        draw = ImageDraw.Draw(img)
-        
-        draw.rectangle([(50, 50), (150, 150)], fill=(255, 0, 0), outline=(0, 0, 0))
-        draw.text((180, 100), "Test Render Image", fill=(0, 0, 0))
-        draw.text((180, 150), f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", fill=(0, 0, 0))
-        
-        # Save to temporary file
-        temp_file = os.path.join(tempfile.gettempdir(), f"test_render_{int(time.time())}.jpg")
-        img.save(temp_file, "JPEG")
-        
-        # Read and encode to base64
-        with open(temp_file, "rb") as f:
-            image_data = f.read()
-        encoded_image_data = base64.b64encode(image_data).decode('utf-8')
-        
-        return {
-            "rendered": True,
-            "output_path": temp_file,
-            "resolution": ["400", "300"],
-            "camera": "test",
-            "image_data": encoded_image_data,
-            "image_size": len(image_data),
-            "render_time": "0s"
-        }
-    except Exception as e:
-        return {"error": f"Failed to create test render: {str(e)}"}
 @mcp.tool()
 def claude_vision_test(ctx: Context) -> Any:
     try:
@@ -795,131 +641,6 @@ def claude_vision_test(ctx: Context) -> Any:
         return f"Error creating vision test: {str(e)}"
 
 
-
-
-@mcp.tool()
-def diagnose_image_import(ctx: Context) -> str:
-    """
-    Diagnoses the correct way to import and use the Image class from MCP.
-    """
-    import inspect
-    import importlib
-    import sys
-    import traceback
-    
-    # Output details about the current MCP module structure
-    result = {
-        "mcp_module_info": {}
-    }
-    
-    try:
-        # Check what's in the mcp module
-        import mcp
-        result["mcp_module_info"]["mcp_dir"] = dir(mcp)
-        
-        # Check server module
-        if hasattr(mcp, "server"):
-            result["mcp_module_info"]["server_dir"] = dir(mcp.server)
-            
-            # Check fastmcp module
-            if hasattr(mcp.server, "fastmcp"):
-                result["mcp_module_info"]["fastmcp_dir"] = dir(mcp.server.fastmcp)
-                
-                # Look specifically for image-related classes or functions
-                image_related = []
-                for name in dir(mcp.server.fastmcp):
-                    if "image" in name.lower():
-                        image_related.append(name)
-                result["mcp_module_info"]["image_related"] = image_related
-    except Exception as e:
-        result["mcp_module_info"]["error"] = str(e)
-    
-    # Try various ways to import and create an image
-    result["import_attempts"] = []
-    
-    # Simple test image data
-    import tempfile
-    import os
-    from PIL import Image as PILImage
-    
-    test_img = PILImage.new("RGB", (100, 100), color=(255, 0, 0))
-    test_path = os.path.join(tempfile.gettempdir(), "mcp_test_img.jpg")
-    test_img.save(test_path)
-    
-    # Attempt 1: Direct from mcp.server.fastmcp
-    try:
-        from mcp.server.fastmcp import Image as Image1
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp import Image",
-            "success": True,
-            "type": str(type(Image1)),
-            "signature": str(inspect.signature(Image1)) if callable(Image1) else "not callable"
-        })
-        
-        # Try to create an image
-        try:
-            img1 = Image1(path=test_path)
-            result["import_attempts"][0]["instance_created"] = True
-        except Exception as e:
-            result["import_attempts"][0]["instance_error"] = str(e)
-            result["import_attempts"][0]["instance_created"] = False
-    except Exception as e:
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp import Image",
-            "success": False,
-            "error": str(e)
-        })
-    
-    # Attempt 2: From utilities.types
-    try:
-        from mcp.server.fastmcp.utilities.types import Image as Image2
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp.utilities.types import Image",
-            "success": True,
-            "type": str(type(Image2)),
-            "signature": str(inspect.signature(Image2)) if callable(Image2) else "not callable"
-        })
-        
-        # Try to create an image
-        try:
-            img2 = Image2(path=test_path)
-            result["import_attempts"][1]["instance_created"] = True
-        except Exception as e:
-            result["import_attempts"][1]["instance_error"] = str(e)
-            result["import_attempts"][1]["instance_created"] = False
-    except Exception as e:
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp.utilities.types import Image",
-            "success": False,
-            "error": str(e)
-        })
-    
-    # Attempt 3: Look for a create_image function
-    try:
-        from mcp.server.fastmcp import create_image
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp import create_image",
-            "success": True,
-            "type": str(type(create_image)),
-            "signature": str(inspect.signature(create_image)) if callable(create_image) else "not callable"
-        })
-        
-        # Try to create an image
-        try:
-            img3 = create_image(path=test_path)
-            result["import_attempts"][2]["instance_created"] = True
-        except Exception as e:
-            result["import_attempts"][2]["instance_error"] = str(e)
-            result["import_attempts"][2]["instance_created"] = False
-    except Exception as e:
-        result["import_attempts"].append({
-            "method": "from mcp.server.fastmcp import create_image",
-            "success": False,
-            "error": str(e)
-        })
-        
-    return result
-
 @mcp.prompt()
 def asset_creation_strategy() -> str:
     """Defines the preferred strategy for creating assets in Houdini"""
@@ -942,7 +663,7 @@ def asset_creation_strategy() -> str:
        - Remember that Houdini uses a node-based material system
        
     5. For complex operations or unique Houdini features:
-       - Use execute_houdini_code() with custom Python code
+       - Use execute_houdini_code() with custom Python code, if nothing else works
        - Take advantage of Houdini's procedural workflow
        
     6. When you need to create a complete scene:
@@ -950,13 +671,21 @@ def asset_creation_strategy() -> str:
        - Set up proper hierarchy if needed
        - Apply materials
        - Configure lighting and camera
-       
-    7. For rendering:
-       - Use render_scene() with use_opengl=True (default) for fast visualization
-       - Only use use_opengl=False when photorealistic rendering is required
-       - OpenGL rendering is significantly faster and more stable for quick views
-       - Set resolution_x and resolution_y for specific output dimensions
-       - Specify a camera_path if you want to render from a specific camera
+       - Iterate by checking render_scene
+
+    7.  Remeber Houdini's coordinate system
+       - Right hand system
+         * X-axis runs left to right (positive right)
+         * Y-axis runs from down to up (positive up)
+         * Z-axis runs from back to front (positive towards back)
+
+    8. For rendering:
+       - Use render_scene() for visualization, very helpful in doublechecking whether things look the way they should
+       - Default resolution is 640x480, which is ideal for quick preview renders
+       - Specify resolution_x and resolution_y only if you need a specific size
+       - Larger resolutions will take longer to render and display
+       - You should specify a camera_path if you want to render
+       - The rendered image will be automatically returned to Claude for viewing
     """
 
 # Main execution
