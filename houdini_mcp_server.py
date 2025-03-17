@@ -651,7 +651,7 @@ def asset_creation_strategy() -> str:
     2. For creating new objects:
        - Use create_object() with appropriate parameters
        - For geometry nodes, specify the primitive_type parameter
-       - Common primitive types: box, sphere, grid, torus, tube
+       - Common primitive types: box, sphere, grid, torus, tube (a cylinder is called a tube in houdini)
        
     3. For modifying existing objects:
        - Use modify_object() with the path or name of the object
@@ -671,13 +671,15 @@ def asset_creation_strategy() -> str:
        - Set up proper hierarchy if needed
        - Apply materials
        - Configure lighting and camera
-       - Iterate by checking render_scene
+       - Iterate by checking render_scene and really thinking about what you see and if it is correct and good
 
     7.  Remeber Houdini's coordinate system
        - Right hand system
          * X-axis runs left to right (positive right)
          * Y-axis runs from down to up (positive up)
          * Z-axis runs from back to front (positive towards back)
+       - Pay special attention to the orientation of primitives you are adding
+       - Primitives such as tubes are natively oriented across Houdini's Z axis
 
     8. For rendering:
        - Use render_scene() for visualization, very helpful in doublechecking whether things look the way they should
@@ -685,6 +687,7 @@ def asset_creation_strategy() -> str:
        - Specify resolution_x and resolution_y only if you need a specific size
        - Larger resolutions will take longer to render and display
        - You should specify a camera_path if you want to render
+       - the camera is pointing at negative Z
        - The rendered image will be automatically returned to Claude for viewing
     """
 

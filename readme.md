@@ -24,23 +24,6 @@ The system consists of two main components:
 
 - Houdini 19.0 or newer
 - Python 3.10 or newer
-- uv package manager
-
-#### Installing uv
-
-If you're on Mac:
-```bash
-brew install uv
-```
-
-On Windows:
-```bash
-pip install uv
-```
-
-For other systems, see the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/).
-
-**⚠️ Do not proceed before installing UV**
 
 ### Claude Desktop Integration
 
@@ -54,50 +37,19 @@ To connect Claude to Houdini:
 {
     "mcpServers": {
         "houdini": {
-            "command": "uvx",
+            "command": "py",
             "args": [
-                "houdini-mcp"
+                "E:/code/houdini-mcp/houdini_mcp_server.py"
             ]
         }
     }
 }
 ```
-
-### Cursor Integration
-
-To use with Cursor, go to Cursor Settings > MCP and paste the following command:
-
-```bash
-uvx houdini-mcp
-```
-
-**⚠️ Only run one instance of the MCP server (either on Cursor or Claude Desktop), not both**
+4. Edit the path to match your location for houdini_mcp_server.py
 
 ### Installing the Houdini Extension
 
-1. Download the `houdini_mcp.py` file
-2. Open Houdini
-3. In Houdini, go to the Python Shell panel
-4. Run the following code to install the extension permanently:
-
-```python
-import os
-import shutil
-
-# Get the Houdini user preferences directory
-user_pref_dir = hou.expandString("$HOUDINI_USER_PREF_DIR")
-python_dir = os.path.join(user_pref_dir, "python")
-
-# Create the python directory if it doesn't exist
-os.makedirs(python_dir, exist_ok=True)
-
-# Copy the houdini_mcp.py file to the python directory
-shutil.copy("PATH_TO_DOWNLOADED_FILE/houdini_mcp.py", os.path.join(python_dir, "houdini_mcp.py"))
-
-print("Installation complete. Restart Houdini to activate.")
-```
-
-Replace `PATH_TO_DOWNLOADED_FILE` with the actual path to where you downloaded the file.
+Copy houdini_mcp.py to your houdini prefs folder python3.11libs/ subfolder
 
 ## Usage
 
@@ -111,7 +63,7 @@ houdini_mcp.start_server()
 
 You should see a message confirming that the server has started.
 
-2. Make sure the MCP server is running from Claude or Cursor.
+2. Make sure the MCP server is running from Claude.
 
 ### Using with Claude
 

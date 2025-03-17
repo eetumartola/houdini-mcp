@@ -513,8 +513,31 @@ class HoudiniMCPServer:
                 if not geo_node:
                     raise ValueError(f"Failed to create geometry node: {name}")
                 
-                # Add a primitive inside the geo node based on requested type
-                inside_node = geo_node.createNode(primitive_type)
+                # Handle primitive creation based on type
+                inside_node = None
+                
+                if primitive_type == "sphere":
+                    # Create a proper geometry sphere rather than a primitive sphere
+                    inside_node = geo_node.createNode("sphere")
+                    # Set divisions to get a smoother sphere (optional)
+                    if inside_node.parm("type"):
+                        inside_node.parm("type").set(0)  # Set to polygon sphere
+                    if inside_node.parm("rows"):
+                        inside_node.parm("rows").set(16)  # Reasonable row division
+                    if inside_node.parm("cols"):
+                        inside_node.parm("cols").set(16)  # Reasonable column division
+                
+                elif primitive_type == "tube":
+                    inside_node = geo_node.createNode("tube")
+                    # Enable caps for the tube
+                    if inside_node.parm("cap"):
+                        inside_node.parm("cap").set(1)  # Enable capping
+                    if inside_node.parm("caps"):
+                        inside_node.parm("caps").set(1)  # Alternative cap parameter name
+                
+                else:
+                    # Default handling for other primitive types
+                    inside_node = geo_node.createNode(primitive_type)
                 
                 # Connect to output
                 output_node = geo_node.createNode("output")
